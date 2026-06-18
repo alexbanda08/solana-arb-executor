@@ -1,0 +1,17 @@
+# Dependencies / build
+node_modules/
+dist/
+build/
+target/
+*.tsbuildinfo
+
+# Secrets / local env (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log

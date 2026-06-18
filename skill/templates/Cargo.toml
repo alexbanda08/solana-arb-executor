@@ -1,0 +1,46 @@
+[package]
+name = "solana-arb-executor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Low-latency Solana arbitrage execution scaffolding: detect -> simulate -> Jito bundle -> land, with mandatory risk gate and confirm-gate."
+license = "MIT"
+publish = false
+
+# The pure math/logic modules (fees.rs, risk.rs) are std-only and self-contained,
+# so they compile and run standalone offline:
+#   rustc --edition 2021 --test src/fees.rs && ./fees
+#   rustc --edition 2021 --test src/risk.rs && ./risk
+# The full crate (main.rs, stream.rs, jito.rs, detector.rs, config.rs) targets the
+# pinned crates below and is built normally with network access:
+#   cargo build
+# See README.md and skill/references/sdk-versions.md (last-verified 2026-06).
+
+[[bin]]
+name = "solana-arb-executor"
+path = "src/main.rs"
+
+[dependencies]
+solana-sdk = "4.0"
+solana-client = "4.0"
+yellowstone-grpc-client = "13.1"
+yellowstone-grpc-proto = "12.5"
+# jito-sdk-rust is early-stage (0.x); pin tightly and re-verify the API on upgrade.
+jito-sdk-rust = "0.3"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+# Explicit: used in jito.rs (tx serialization) and stream.rs (account parsing).
+futures = "0.3"
+bincode = "1"
+bs58 = "0.5"
+serde_json = "1"
+
+# No dev-dependencies: fees.rs and risk.rs tests are std-only (#[cfg(test)] mod tests).
+
+[profile.release]
+# Hot-path build: optimize for latency, keep symbols off the inner loop.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

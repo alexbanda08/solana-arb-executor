@@ -1,0 +1,25 @@
+{
+  "name": "solana-arb-executor",
+  "owner": {
+    "name": "Alexandre Bandarra"
+  },
+  "plugins": [
+    {
+      "name": "solana-arb-executor",
+      "source": "./",
+      "description": "Rust low-latency Solana arbitrage execution skill (gRPC ingestion, Jito bundles, tx landing, risk/kill-switch)",
+      "version": "0.1.0",
+      "license": "MIT",
+      "keywords": [
+        "solana",
+        "rust",
+        "arbitrage",
+        "mev",
+        "jito",
+        "yellowstone",
+        "low-latency",
+        "execution"
+      ]
+    }
+  ]
+}
