@@ -15,6 +15,8 @@
 // Pin the version tightly in Cargo.toml and re-verify on upgrade.
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use jito_sdk_rust::JitoJsonRpcSDK;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -58,25 +60,22 @@ pub struct SimulationResult {
 // Tip account resolution
 // ---------------------------------------------------------------------------
 
-/// Fetch the live tip account list from the block engine and return one.
-/// The SDK returns multiple accounts; we take the first (all are equivalent).
+/// Fetch a live tip account from the block engine.
+///
+/// Tip accounts ROTATE, so we resolve one at runtime rather than hardcoding.
+/// We use the SDK's `get_random_tip_account`, which is the one-call convenience
+/// the official jito-rust-rpc example uses: it reads the array from the JSON-RPC
+/// `result` field (NOT the top-level response -- a manual `as_array()` on the
+/// raw response returns None and always errors) and picks one at random, which
+/// also load-balances tip flow across the equivalent accounts.
 pub async fn fetch_tip_account(sdk: &JitoJsonRpcSDK) -> Result<Pubkey> {
-    let tip_accounts = sdk
-        .get_tip_accounts()
+    let account = sdk
+        .get_random_tip_account()
         .await
-        .context("fetching Jito tip accounts")?;
+        .context("fetching Jito tip account")?;
 
-    let accounts = tip_accounts
-        .as_array()
-        .context("tip accounts response is not a JSON array")?;
-
-    let first = accounts
-        .first()
-        .context("tip accounts list is empty")?
-        .as_str()
-        .context("tip account entry is not a string")?;
-
-    Pubkey::from_str(first).with_context(|| format!("parsing tip account pubkey: {}", first))
+    Pubkey::from_str(&account)
+        .with_context(|| format!("parsing tip account pubkey: {}", account))
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +154,13 @@ pub async fn simulate_bundle(
     use solana_client::rpc_config::RpcSimulateTransactionConfig;
     use solana_sdk::commitment_config::CommitmentConfig;
 
+    // LATENCY: this uses the BLOCKING solana_client::rpc_client::RpcClient inside an
+    // async fn, which parks a tokio worker for the round-trip. It is an explicit,
+    // documented trade-off (one simulate per candidate; simplest correct code) per
+    // rules/rust-style.md. To free the executor under high candidate rates, wrap
+    // this call in tokio::task::spawn_blocking, or switch to
+    // solana_client::nonblocking::rpc_client::RpcClient and .await it.
+
     let first_tx = bundle
         .transactions
         .first()
@@ -220,18 +226,29 @@ pub async fn submit_bundle(
         eprintln!("[jito] REQUIRE_CONFIRM=false -- submitting without interactive confirmation");
     }
 
-    // Serialize transactions to base58/base64 as required by jito-sdk-rust send_bundle.
+    // Serialize each transaction with bincode (1.x; the wire format the runtime
+    // expects) then base64-encode it. This matches the official jito-rust-rpc
+    // example. `bincode::serialize` is the 1.x API -- do not bump to bincode 2/3,
+    // whose API differs and which jito-sdk-rust itself does not use.
     let encoded: Vec<String> = bundle
         .transactions
         .iter()
         .map(|tx| {
-            let bytes = bincode::serialize(tx).expect("tx serialize");
-            bs58::encode(&bytes).into_string()
+            let bytes = bincode::serialize(tx).context("serializing tx for bundle")?;
+            Ok(BASE64_STANDARD.encode(bytes))
         })
-        .collect();
+        .collect::<Result<Vec<String>>>()?;
+
+    // send_bundle takes Option<serde_json::Value>, NOT Vec<String>. The validated
+    // shape is a 2-element array: [ [tx, ...], { "encoding": "base64" } ]. The SDK
+    // rejects anything else; passing a bare Vec<String> does not even compile.
+    let params = serde_json::json!([
+        serde_json::Value::from(encoded),
+        { "encoding": "base64" }
+    ]);
 
     let response = sdk
-        .send_bundle(Some(encoded), None)
+        .send_bundle(Some(params), None)
         .await
         .context("Jito send_bundle RPC call")?;
 
@@ -249,8 +266,20 @@ pub async fn submit_bundle(
 /// Poll the block engine for bundle status until it is confirmed, failed, or
 /// we exceed `max_attempts`.
 ///
-/// Returns the final status string. Callers should treat anything other than
-/// "Landed" (or equivalent confirmed status) as a revert for risk accounting.
+/// Jito exposes TWO status endpoints with DIFFERENT field shapes, and conflating
+/// them is a common bug (matching `failed`/`Invalid` against `confirmation_status`
+/// never fires, because those values only appear on the in-flight `status` field):
+///   - get_in_flight_bundle_statuses -> per bundle a `status` of
+///     Invalid | Pending | Failed | Landed. This is the FAST path for landing /
+///     failure detection while the bundle is still in flight.
+///   - get_bundle_statuses -> per bundle a `confirmation_status`
+///     (processed | confirmed | finalized) plus a separate `err`. This is the
+///     authoritative reconciliation once the bundle has landed on-chain.
+///
+/// We poll the in-flight endpoint for a quick verdict, then confirm `Landed`
+/// against get_bundle_statuses (confirmation_status + err) before reporting
+/// success. Callers treat anything other than a confirmed landing as a revert
+/// for risk accounting.
 pub async fn poll_bundle_status(
     sdk: &JitoJsonRpcSDK,
     bundle_id: &str,
@@ -259,32 +288,38 @@ pub async fn poll_bundle_status(
     use tokio::time::{sleep, Duration};
 
     for attempt in 0..max_attempts {
-        let status_response = sdk
-            .get_bundle_statuses(vec![bundle_id.to_string()])
+        // --- Fast path: in-flight `status` (Landed/Pending/Failed/Invalid) ---
+        let inflight = sdk
+            .get_in_flight_bundle_statuses(vec![bundle_id.to_string()])
             .await
-            .with_context(|| format!("get_bundle_statuses attempt {}", attempt))?;
+            .with_context(|| format!("get_in_flight_bundle_statuses attempt {}", attempt))?;
 
-        // Response schema: {"result": {"value": [{"bundle_id":..., "confirmation_status":...}]}}
-        let status = status_response
-            .pointer("/result/value/0/confirmation_status")
+        let inflight_status = inflight
+            .pointer("/result/value/0/status")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        match status.as_deref() {
-            Some("finalized") | Some("confirmed") => {
-                eprintln!("[jito] bundle {} status: confirmed", bundle_id);
-                return Ok(status.unwrap());
+        match inflight_status.as_deref() {
+            Some("Failed") | Some("Invalid") => {
+                bail!(
+                    "bundle {} in-flight status: {}",
+                    bundle_id,
+                    inflight_status.as_deref().unwrap_or("Failed")
+                );
             }
-            Some("failed") | Some("Invalid") => {
-                let err = status_response
-                    .pointer("/result/value/0/err")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                bail!("bundle {} failed: {}", bundle_id, err);
+            Some("Landed") => {
+                // --- Reconcile against confirmation_status + err ---
+                let final_status =
+                    reconcile_landed_bundle(sdk, bundle_id, attempt).await?;
+                eprintln!(
+                    "[jito] bundle {} landed (confirmation_status={})",
+                    bundle_id, final_status
+                );
+                return Ok(final_status);
             }
             Some(other) => {
                 eprintln!(
-                    "[jito] bundle {} status: {} (attempt {}/{})",
+                    "[jito] bundle {} in-flight status: {} (attempt {}/{})",
                     bundle_id, other, attempt + 1, max_attempts
                 );
             }
@@ -304,6 +339,45 @@ pub async fn poll_bundle_status(
         bundle_id,
         max_attempts
     )
+}
+
+/// Once the in-flight endpoint reports `Landed`, confirm via get_bundle_statuses,
+/// which carries `confirmation_status` (processed/confirmed/finalized) and a
+/// separate `err`. A non-null `err` means the bundle landed but a transaction in
+/// it reverted -> treat as failure for risk accounting.
+async fn reconcile_landed_bundle(
+    sdk: &JitoJsonRpcSDK,
+    bundle_id: &str,
+    attempt: u32,
+) -> Result<String> {
+    let resp = sdk
+        .get_bundle_statuses(vec![bundle_id.to_string()])
+        .await
+        .with_context(|| format!("get_bundle_statuses (reconcile) attempt {}", attempt))?;
+
+    // Response schema: {"result": {"value": [{"confirmation_status":..., "err":...}]}}
+    if let Some(err) = resp.pointer("/result/value/0/err") {
+        // `err` is typically {"Ok": null} on success or a non-null error object.
+        let is_failure = match err {
+            serde_json::Value::Null => false,
+            serde_json::Value::Object(map) => {
+                // {"Ok": null} signals no error; anything else is a revert.
+                !matches!(map.get("Ok"), Some(serde_json::Value::Null))
+            }
+            _ => true,
+        };
+        if is_failure {
+            bail!("bundle {} landed but a tx reverted: {}", bundle_id, err);
+        }
+    }
+
+    let confirmation_status = resp
+        .pointer("/result/value/0/confirmation_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("confirmed")
+        .to_string();
+
+    Ok(confirmation_status)
 }
 
 // ---------------------------------------------------------------------------

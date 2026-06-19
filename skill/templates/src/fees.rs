@@ -92,9 +92,8 @@ mod tests {
     fn priority_fee_rounds_up() {
         // 1 microlamport * 1 CU = 1 microlamport -> ceil to 1 lamport.
         assert_eq!(priority_fee_lamports(1, 1), 1);
-        // 1_500_000 microlamports total = 1.5 lamports -> ceil to 2.
-        assert_eq!(priority_fee_lamports(1_000_000, 1) + 0, 1);
-        assert_eq!(priority_fee_lamports(1500, 1000), 2); // 1_500_000 / 1e6 = 1.5 -> 2
+        // 1500 microlamports/CU * 1000 CU = 1_500_000 microlamports = 1.5 lamports -> ceil to 2.
+        assert_eq!(priority_fee_lamports(1500, 1000), 2);
         // 999_999 microlamports -> 0.999999 lamports -> ceil to 1.
         assert_eq!(priority_fee_lamports(999_999, 1), 1);
         // 1_000_001 microlamports -> 1.000001 -> ceil to 2.

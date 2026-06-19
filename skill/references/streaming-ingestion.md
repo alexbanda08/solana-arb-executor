@@ -53,14 +53,14 @@ fn build_request(pool_accounts: Vec<String>) -> SubscribeRequest {
             account: pool_accounts, // explicit pubkeys you trade against
             owner: vec![],
             filters: vec![],
-            nonempty_txn_signature: None,
+            ..Default::default() // 12.5 added cuckoo_accounts_filter; never spell every field
         },
     );
 
     let mut slots = HashMap::new();
     slots.insert(
         "slots".to_string(),
-        SubscribeRequestFilterSlots { filter_by_commitment: Some(true), interslot_updates: None },
+        SubscribeRequestFilterSlots { filter_by_commitment: Some(true), ..Default::default() },
     );
 
     SubscribeRequest {
@@ -77,14 +77,24 @@ does not exist in 12.5, use `..Default::default()` and set only the fields the
 compiler confirms. Do not invent fields; run `cargo build` and follow the errors.
 
 ## Connect, subscribe, consume
+TLS GOTCHA: every real Triton/Helius Yellowstone endpoint is `https://`, and tonic
+will NOT negotiate TLS unless you attach a `tls_config` -- without it `connect()`
+fails with a transport/TLS error. Attach native roots for https; skip TLS for
+plaintext (`http://`, local/dev). `ClientTlsConfig` is re-exported from
+`yellowstone_grpc_client`.
+
 ```rust
 use anyhow::{Context, Result};
 use futures::{sink::SinkExt, stream::StreamExt};
-use yellowstone_grpc_client::GeyserGrpcClient;
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 
 async fn run(endpoint: String, x_token: Option<String>, req: SubscribeRequest) -> Result<()> {
-    let mut client = GeyserGrpcClient::build_from_shared(endpoint)?
-        .x_token(x_token)?            // None for unauthenticated endpoints
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint.clone())?
+        .x_token(x_token)?;          // None for unauthenticated endpoints
+    if endpoint.starts_with("https://") {
+        builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
+    }
+    let mut client = builder
         .connect()
         .await
         .context("geyser connect")?;
@@ -124,6 +134,10 @@ end-of-stream and errors identically: reconnect.
 - Recommended path: ship v1 on Yellowstone account/slot streaming (above). Add
   ShredStream later only if measured latency to detection is your bottleneck and you
   can validate every hint against account state + simulation before acting.
+- Concrete path: run jito-labs/shredstream-proxy (Rust; flags `--block-engine-url`,
+  `--auth-keypair`, `--grpc-service-port`) and decode entries with the protobufs in
+  jito-labs/mev-protos. Treat shreds as early HINTs validated against account state
+  + simulation, never as confirmed truth.
 
 ## Latency discipline
 - Avoid allocation in the per-update branch (see rules/rust-style.md). Pre-allocate

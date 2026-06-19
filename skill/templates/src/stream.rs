@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 // Yellowstone gRPC re-exports from the pinned crates.
-use yellowstone_grpc_client::GeyserGrpcClient;
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_request_filter_accounts_filter::Filter as AccountFilter,
     subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
@@ -126,24 +126,41 @@ async fn run_stream(
     tx: &mpsc::Sender<StreamUpdate>,
 ) -> Result<()> {
     // Build the gRPC client. Token is sent as a x-token metadata header by the client.
-    let mut client = GeyserGrpcClient::build_from_shared(cfg.grpc_url.clone())
+    //
+    // TLS GOTCHA: every real Triton/Helius Yellowstone endpoint is `https://`,
+    // and tonic will NOT negotiate TLS unless a tls_config is attached -- without
+    // it `connect()` fails with a transport/TLS error. We attach native roots for
+    // https URLs and skip TLS for plaintext (`http://`, local/dev) so both work.
+    let mut builder = GeyserGrpcClient::build_from_shared(cfg.grpc_url.clone())
         .context("building GeyserGrpcClient")?
         .x_token(if cfg.grpc_token.is_empty() {
             None
         } else {
             Some(cfg.grpc_token.clone())
         })
-        .context("setting x-token")?
-        .connect()
-        .await
-        .context("gRPC connect")?;
+        .context("setting x-token")?;
+
+    if cfg.grpc_url.starts_with("https://") {
+        builder = builder
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .context("configuring TLS for https gRPC endpoint")?;
+    }
+
+    let mut client = builder.connect().await.context("gRPC connect")?;
 
     // Build account filter: subscribe to all listed pubkeys by literal address match.
+    //
+    // We set only the fields we rely on and fall back to `..Default::default()`
+    // for the rest. yellowstone-grpc-proto adds fields between minor releases
+    // (12.5 added `cuckoo_accounts_filter` here, `interslot_updates` on slots,
+    // and `from_slot` on SubscribeRequest); spelling every field out would break
+    // the build on the next bump. Every proto struct derives Default, so this is
+    // the crate's own recommended pattern (see references/streaming-ingestion.md).
     let account_filter = SubscribeRequestFilterAccounts {
         account: cfg.account_keys.clone(),
         owner: vec![],
         filters: vec![],
-        nonempty_txn_signature: None,
+        ..Default::default()
     };
 
     let mut accounts: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
@@ -154,20 +171,15 @@ async fn run_stream(
         "slots".to_string(),
         SubscribeRequestFilterSlots {
             filter_by_commitment: Some(true),
+            ..Default::default()
         },
     );
 
     let request = SubscribeRequest {
         accounts,
         slots,
-        transactions: HashMap::new(),
-        transactions_status: HashMap::new(),
-        blocks: HashMap::new(),
-        blocks_meta: HashMap::new(),
-        entry: HashMap::new(),
         commitment: Some(CommitmentLevel::Processed as i32),
-        accounts_data_slice: vec![],
-        ping: None,
+        ..Default::default()
     };
 
     // Subscribe returns a streaming response.

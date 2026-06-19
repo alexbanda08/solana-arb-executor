@@ -18,7 +18,7 @@ Routes an execution-infra request to exactly one focused leaf and emits real, im
 
 - **Ingestion** -- `yellowstone-grpc-client` account/slot subscription at `processed` commitment, with reconnect and backoff.
 - **Detection** -- post-fee, post-slippage spread vs threshold over streamed pool state.
-- **Execution** -- simulate-first Jito bundles (<=5 tx, tip in the LAST tx, tip accounts fetched at runtime), priority-fee / CU-limit sizing, retry discipline.
+- **Execution** -- simulate-first Jito bundles (<=5 tx, tip in the LAST tx, tip accounts fetched at runtime), competition-aware tip sizing (fraction-of-edge with a hard floor/ceiling and post-tip abort), two-phase bundle-status reconciliation, priority-fee / CU-limit sizing, retry discipline. Real multi-hop routes need v0 `VersionedTransaction` + Address Lookup Tables (documented; the v0/ALT/signing build is delegated to `solana-dev`).
 - **Risk** -- a `RiskGate` with max-notional / max-position / daily-loss caps, a consecutive-revert circuit breaker, and a kill-switch -- checked on every order before it can reach the confirm-gate.
 - **Plumbing it does NOT reinvent** -- Anchor, IDLs, program calls, and transaction signing are delegated to the sibling `solana-dev` skill.
 
@@ -30,7 +30,7 @@ This skill *is* the execution layer those omit -- the Rust hot path that ingests
 
 ## Honest economics
 
-Retail spatial DEX arb is **infrastructure-dominated**. Raw price gaps are taken by parties with co-located bare-metal, private leader paths, and sub-10ms bundle budgets that a single-box bot will not match; Jito tips eat a large share of the gross edge on contested atomic ops. Shaving microseconds off decode changes nothing when network RTT dominates.
+Retail spatial DEX arb is **infrastructure-dominated**. Raw price gaps are taken by parties with co-located bare-metal, private leader paths, and sub-10ms bundle budgets that a single-box bot will not match; Jito tips eat a large share of the gross edge on contested atomic ops (~50-60% of the extracted edge in 2025/2026), and there is no guaranteed-inclusion tip. Shaving microseconds off decode changes nothing when network RTT dominates.
 
 Where retail edge actually survives: **correct landing** (simulate-first, right CU price, tip sizing, retry discipline so the txns you send actually land instead of burning fees on reverts), **risk discipline** (caps, breaker, kill-switch), and **less-contested opportunities** (funding-basis, cross-venue rate gaps, longer-horizon plays where latency is not the deciding factor). That is what this skill leads with. It is scaffolding + knowledge, **not** a hosted bot and **not** a guaranteed profit machine.
 
@@ -73,7 +73,7 @@ Load-bearing, enforced in every execution template and in `rules/no-auto-execute
 
 ## Stack (2026, last-verified 2026-06)
 
-`solana-sdk 4.0.1` ("4.0") - `solana-client 4.0.0` ("4.0") - `yellowstone-grpc-client 13.1.1` ("13.1") - `yellowstone-grpc-proto 12.5.0` ("12.5") - `jito-sdk-rust 0.3.2` ("0.3", **early 0.x -- API may shift; pin and review**) - `tokio 1` (full) - `anyhow 1` - `serde 1` (derive). Rust toolchain 1.96, edition 2021. Run `cargo search <crate>` or `cargo add <crate>` to confirm latest. See `skill/references/sdk-versions.md`.
+`solana-sdk 4.0.1` ("4.0") - `solana-client 4.0.0` ("4.0") - `yellowstone-grpc-client 13.1.1` ("13.1") - `yellowstone-grpc-proto 12.5.0` ("12.5") - `jito-sdk-rust 0.3.2` ("0.3", **early 0.x -- API may shift; pin and review**) - `tokio 1` (full) - `anyhow 1` - `serde 1` (derive) - `bincode 1` (pinned 1.x to match jito-sdk-rust) - `base64 0.22`. Rust toolchain 1.96, edition 2021. Run `cargo search <crate>` or `cargo add <crate>` to confirm latest. See `skill/references/sdk-versions.md`.
 
 ## License
 

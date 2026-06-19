@@ -218,7 +218,25 @@ async fn handle_candidate(
         .get_latest_blockhash()
         .context("fetching recent blockhash")?;
 
-    let tip_lamports = compute_tip_lamports(candidate.net_profit_lamports);
+    // Size the tip from the net edge with a hard floor/ceiling, and ABORT this
+    // candidate if no edge survives the tip (None => skip, never submit).
+    let min_net_floor_lamports = bps_to_lamports_floor(cfg.spread_threshold_bps);
+    let tip_lamports = match compute_tip_lamports(
+        candidate.net_profit_lamports,
+        cfg.tip_bps,
+        cfg.tip_floor_lamports,
+        cfg.tip_ceil_lamports,
+        min_net_floor_lamports,
+    ) {
+        Some(tip) => tip,
+        None => {
+            eprintln!(
+                "[main] tip-gate abort | slot={} net_profit={} below post-tip threshold ({}); skipping",
+                candidate.slot, candidate.net_profit_lamports, min_net_floor_lamports
+            );
+            return Ok(());
+        }
+    };
 
     // Swap instructions placeholder -- replace with real DEX calls.
     let arb_instruction_groups: Vec<(Vec<solana_sdk::instruction::Instruction>, Vec<&solana_sdk::signature::Keypair>)> = vec![
@@ -295,10 +313,45 @@ fn bps_to_lamports_floor(bps: u32) -> u64 {
     (LAMPORTS_PER_SOL * bps as u64) / 10_000
 }
 
-/// Tip = 20% of net profit. Tune this to remain competitive without over-tipping.
-/// See references/jito-bundles.md for tip strategy notes.
-fn compute_tip_lamports(net_profit_lamports: u64) -> u64 {
-    net_profit_lamports / 5
+/// Size the Jito tip from the net edge and decide whether the candidate is still
+/// worth submitting AFTER the tip.
+///
+/// Returns `Some(tip)` when the trade clears the post-tip threshold, or `None`
+/// (caller MUST skip the candidate) when tipping would leave net <= the spread
+/// floor. This implements the floor/ceiling/abort discipline documented in
+/// references/jito-bundles.md:
+///   - tip = net_profit * tip_bps / 10_000, then clamped to [floor, ceiling];
+///   - ABORT (None) if net_profit <= floor (cannot even meet the minimum tip),
+///     or if net_profit - tip <= min_net_floor (no edge left after tipping).
+///
+/// Contested atomic arb pays ~50-60% of extracted edge; a flat 20% loses
+/// inclusion on contested slots and over-tips on quiet ones. There is no
+/// guaranteed-inclusion tip -- the durable edge is correct landing + risk
+/// discipline + less-contested ops, not a bigger tip.
+fn compute_tip_lamports(
+    net_profit_lamports: u64,
+    tip_bps: u32,
+    tip_floor_lamports: u64,
+    tip_ceil_lamports: u64,
+    min_net_floor_lamports: u64,
+) -> Option<u64> {
+    // Can't even afford the minimum tip -> not worth submitting.
+    if net_profit_lamports <= tip_floor_lamports {
+        return None;
+    }
+
+    // tip = net * bps / 10_000 with a u128 intermediate to avoid overflow.
+    let raw_tip =
+        ((net_profit_lamports as u128) * (tip_bps as u128) / 10_000u128) as u64;
+    let tip = raw_tip.clamp(tip_floor_lamports, tip_ceil_lamports);
+
+    // Net after tipping must clear the minimum-edge floor, else abort.
+    let net_after_tip = net_profit_lamports.saturating_sub(tip);
+    if net_after_tip <= min_net_floor_lamports {
+        return None;
+    }
+
+    Some(tip)
 }
 
 /// Load the payer Keypair from a JSON file path specified by ARB_KEYPAIR_PATH.
@@ -311,8 +364,11 @@ fn load_keypair() -> Result<solana_sdk::signature::Keypair> {
         .with_context(|| format!("reading keypair from {}", path))?;
     let bytes: Vec<u8> = serde_json::from_str::<Vec<u8>>(&data)
         .with_context(|| format!("parsing keypair JSON from {}", path))?;
-    solana_sdk::signature::Keypair::from_bytes(&bytes)
-        .with_context(|| format!("constructing Keypair from bytes in {}", path))
+    // solana-sdk 4 moved keypair construction to the solana-keypair crate and
+    // REMOVED Keypair::from_bytes; the supported path is the std TryFrom impl
+    // (TryFrom<&[u8]>), which returns a conversion error we wrap with context.
+    solana_sdk::signature::Keypair::try_from(&bytes[..])
+        .map_err(|e| anyhow::anyhow!("constructing Keypair from bytes in {}: {}", path, e))
 }
 
 /// Placeholder: returns an empty instruction list.
@@ -329,4 +385,75 @@ fn build_swap_instructions_placeholder(
     // dry-run. Build real instructions via ../solana-dev/ (see delegation.md)
     // before going live; the confirm-gate still governs every live send.
     Ok(vec![])
+}
+
+// ---------------------------------------------------------------------------
+// Tests (run with `cargo test`; the full crate links the pinned deps).
+//
+// These exercise the pure tip-sizing discipline -- fraction-of-edge with a hard
+// floor/ceiling and the post-tip abort -- which is the SOTA-aligned change in
+// this module. compute_tip_lamports has no external dependencies, so the cases
+// below are exact and deterministic.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::compute_tip_lamports;
+
+    // (bps=5000 => 50%, floor=1_000, ceil=10_000_000, min_net_floor=10_000)
+
+    #[test]
+    fn tip_is_fraction_of_edge() {
+        // 50% of 1_000_000 = 500_000; net after tip = 500_000 > floor 10_000 -> ok.
+        assert_eq!(
+            compute_tip_lamports(1_000_000, 5000, 1_000, 10_000_000, 10_000),
+            Some(500_000)
+        );
+    }
+
+    #[test]
+    fn tip_respects_ceiling() {
+        // 50% of 100_000_000 = 50_000_000, clamped down to the 10_000_000 ceiling.
+        assert_eq!(
+            compute_tip_lamports(100_000_000, 5000, 1_000, 10_000_000, 10_000),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn tip_raised_to_floor() {
+        // 10% of 50_000 = 5_000, but a 6_000 floor raises the tip to 6_000.
+        // net after tip = 44_000 > min_net_floor 100 -> ok.
+        assert_eq!(
+            compute_tip_lamports(50_000, 1000, 6_000, 10_000_000, 100),
+            Some(6_000)
+        );
+    }
+
+    #[test]
+    fn aborts_when_edge_below_floor() {
+        // net_profit <= tip_floor -> cannot afford the minimum tip -> abort.
+        assert_eq!(
+            compute_tip_lamports(800, 5000, 1_000, 10_000_000, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn aborts_when_no_edge_survives_tip() {
+        // 50% of 15_000 = 7_500 tip; net after tip = 7_500 <= min_net_floor 10_000
+        // -> abort (do not submit a candidate that loses its edge to the tip).
+        assert_eq!(
+            compute_tip_lamports(15_000, 5000, 1_000, 10_000_000, 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn high_bps_still_clamped_by_ceiling() {
+        // 100% of edge would be 5_000_000 but ceiling caps at 1_000_000.
+        assert_eq!(
+            compute_tip_lamports(5_000_000, 10_000, 1_000, 1_000_000, 10_000),
+            Some(1_000_000)
+        );
+    }
 }

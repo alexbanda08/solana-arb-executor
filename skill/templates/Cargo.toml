@@ -32,8 +32,13 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 # Explicit: used in jito.rs (tx serialization) and stream.rs (account parsing).
 futures = "0.3"
+# bincode pinned to 1.x deliberately: jito-sdk-rust 0.3 depends on bincode ^1.3,
+# and bincode::serialize(&tx) here is the 1.x API. Do NOT bump to 2/3.
 bincode = "1"
 bs58 = "0.5"
+# base64 for the Jito send_bundle path: txs are bincode-serialized then base64
+# with {"encoding":"base64"}, matching the official jito-rust-rpc example.
+base64 = "0.22"
 serde_json = "1"
 
 # No dev-dependencies: fees.rs and risk.rs tests are std-only (#[cfg(test)] mod tests).

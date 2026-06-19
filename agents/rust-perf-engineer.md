@@ -96,6 +96,8 @@ ARB_JITO_URL=<required; error at startup if unset>
 
 No secrets in Config struct fields (no private keys). The keypair path is read from
 ARB_KEYPAIR_PATH (in main.rs) and loaded at call time, never stored in Config.
+Note: solana-sdk 4 removed `Keypair::from_bytes`; construct with
+`Keypair::try_from(&bytes[..])` (the std TryFrom impl). See references/sdk-versions.md.
 
 ### src/stream.rs
 
@@ -103,10 +105,13 @@ Uses yellowstone-grpc-client 13.1 SubscribeRequest. Subscribe to:
 - accounts filter: the pool accounts under surveillance.
 - slots filter: commitment = processed (fastest confirmation tier).
 
-Reconnect strategy: exponential backoff starting at 500 ms, cap at 30 s, jitter
-+/- 20%. Log each reconnect attempt with level=warn. The reconnect loop is the
-outer loop; the subscribe+consume loop is inner. Channel send to detector is
-non-blocking (try_send); log and drop if channel is full (never block ingestion).
+Reconnect strategy: exponential backoff starting at 250 ms, cap at 30 s. Log each
+reconnect attempt with level=warn. The reconnect loop is the outer loop; the
+subscribe+consume loop is inner. Channel send to the detector is TWO-TIER (as
+shipped in stream.rs): SLOT updates use non-blocking `try_send` (drop under
+back-pressure -- a slot is just a clock tick), ACCOUNT updates use blocking
+`send().await` (never drop a pool-state write, or the detector fires on stale
+state -- back-pressure is the intended safety behavior here).
 
 ### src/detector.rs
 
@@ -125,7 +130,7 @@ in the inner detection loop (reuse a pre-allocated Opportunity buffer).
 
 Bundle construction:
 1. Build swap tx(s) (at most 4 payload txs).
-2. Build tip tx (tip transfer to one of get_tip_accounts() results, tip in LAST tx).
+2. Build tip tx (tip transfer to a runtime-fetched tip account via get_random_tip_account(), tip in LAST tx). Tip is sized as a fraction of edge with a hard floor/ceiling and a post-tip abort (see references/jito-bundles.md).
 3. Call simulateTransaction on ALL txs before bundle assembly. Abort if any sim fails.
 4. If REQUIRE_CONFIRM=true, print the bundle summary and block on stdin confirmation.
 5. If DRY_RUN=true, log "DRY_RUN: would send bundle" and return without sending.

@@ -21,6 +21,9 @@
 //   ARB_CU_LIMIT_ESTIMATE          -- CU limit estimate per tx (default: 200_000)
 //   ARB_CU_MARGIN_BPS              -- CU estimate margin in bps (default: 1500 = 15%)
 //   ARB_CU_PRICE_MICROLAMPORTS     -- priority fee price (default: 10_000)
+//   ARB_TIP_BPS                    -- tip as bps of net edge (default: 5000 = 50%)
+//   ARB_TIP_FLOOR_LAMPORTS         -- minimum tip if we tip at all (default: 1_000)
+//   ARB_TIP_CEIL_LAMPORTS          -- maximum tip, never donate more (default: 10_000_000)
 
 use anyhow::{bail, Context, Result};
 use crate::risk::RiskLimits;
@@ -57,6 +60,15 @@ pub struct Config {
     pub cu_margin_bps: u32,
     /// Priority fee price in microlamports per CU.
     pub cu_price_microlamports: u64,
+
+    // --- tip sizing (Jito) ---
+    /// Tip expressed as basis points of the net edge. Contested atomic arb pays
+    /// ~50-60% of extracted edge; 5000 bps (50%) is a competitive default.
+    pub tip_bps: u32,
+    /// Hard floor: if we tip at all, never tip below this (a dust tip never lands).
+    pub tip_floor_lamports: u64,
+    /// Hard ceiling: never donate more than this regardless of edge.
+    pub tip_ceil_lamports: u64,
 }
 
 impl Config {
@@ -98,6 +110,19 @@ impl Config {
         let cu_price_microlamports =
             parse_u64_env("ARB_CU_PRICE_MICROLAMPORTS", 10_000).context("ARB_CU_PRICE_MICROLAMPORTS")?;
 
+        let tip_bps = parse_u32_env("ARB_TIP_BPS", 5000).context("ARB_TIP_BPS")?;
+        let tip_floor_lamports =
+            parse_u64_env("ARB_TIP_FLOOR_LAMPORTS", 1_000).context("ARB_TIP_FLOOR_LAMPORTS")?;
+        let tip_ceil_lamports =
+            parse_u64_env("ARB_TIP_CEIL_LAMPORTS", 10_000_000).context("ARB_TIP_CEIL_LAMPORTS")?;
+        if tip_floor_lamports > tip_ceil_lamports {
+            bail!(
+                "ARB_TIP_FLOOR_LAMPORTS ({}) must not exceed ARB_TIP_CEIL_LAMPORTS ({})",
+                tip_floor_lamports,
+                tip_ceil_lamports
+            );
+        }
+
         let cfg = Config {
             dry_run,
             require_confirm,
@@ -115,9 +140,16 @@ impl Config {
             cu_limit_estimate,
             cu_margin_bps,
             cu_price_microlamports,
+            tip_bps,
+            tip_floor_lamports,
+            tip_ceil_lamports,
         };
 
-        // Emit safety posture at startup so it is visible in logs.
+        // Emit safety + tip posture at startup so it is visible in logs.
+        eprintln!(
+            "[config] tip_bps={} tip_floor={} tip_ceil={} lamports",
+            cfg.tip_bps, cfg.tip_floor_lamports, cfg.tip_ceil_lamports,
+        );
         eprintln!(
             "[config] DRY_RUN={} REQUIRE_CONFIRM={} max_notional={:.4} SOL max_daily_loss={:.4} SOL",
             cfg.dry_run,

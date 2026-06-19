@@ -68,7 +68,7 @@ accounts.insert(
         ],
         owner:   vec![],
         filters: vec![],
-        nonempty_txn_signature: None,
+        ..Default::default() // proto adds fields between minors (12.5: cuckoo_accounts_filter); never spell every field
     },
 );
 ```
@@ -87,6 +87,7 @@ slots.insert(
     "slot_watch".to_string(),
     SubscribeRequestFilterSlots {
         filter_by_commitment: Some(true),
+        ..Default::default() // 12.5 added interslot_updates; let Default fill new fields
     },
 );
 // And at the top-level request:
@@ -124,22 +125,33 @@ loop {
 If the structure differs, refactor to match. A reconnect loop that is inner to the
 consume loop will silently drop updates during the connection race.
 
-### 6. Verify the channel send is non-blocking
+### 6. Verify the two-tier channel send (drop slots, never drop accounts)
 
-Find the channel send in stream.rs. It must use try_send (non-blocking), never send
-(blocking), because blocking ingestion on a full channel stalls the entire
-slot-update pipeline:
+Find the channel send in stream.rs. It uses TWO send disciplines on purpose, and
+they must not be collapsed into one:
+
+- SLOT updates use `try_send` (non-blocking): a slot is a clock tick, so dropping
+  one under back-pressure is harmless and must never stall the read loop.
+- ACCOUNT updates use blocking `send().await`: dropping a pool-state write would
+  leave the detector acting on STALE pool state (a correctness bug, not a latency
+  one), so account updates apply back-pressure instead of being dropped.
 
 ```rust
-// LATENCY: try_send is O(1) and never blocks ingestion.
-// If the channel is full, the detector is falling behind; log and drop.
-if let Err(e) = tx.try_send(update) {
-    tracing::warn!("detector channel full, dropping update: {e}");
+// Slot: best-effort, drop under back-pressure (it is just a clock tick).
+let _ = tx.try_send(StreamUpdate::Slot(s));
+
+// Account: blocking send -- never drop a pool-state write, or the detector
+// fires on stale state. Back-pressure here is the intended safety behavior.
+if tx.send(StreamUpdate::Account(snap)).await.is_err() {
+    return Ok(()); // receiver dropped -> stop
 }
 ```
 
-If you see a plain `tx.send(update).await` in the hot path, replace it with
-try_send and add the warn log.
+This matches the shipped stream.rs. Do NOT "simplify" the account path to
+`try_send`: that trades a correctness guarantee for latency the detector cannot
+use. If the detector falls behind often, speed up the detector or widen the
+channel (references/opportunity-detection.md) -- do not start dropping account
+writes.
 
 ### 7. Wire the channel receiver into the detector
 
@@ -204,6 +216,6 @@ if you are running one. Confirm backoff doubles on successive failures (500 -> 1
 - [ ] Pool account pubkeys are real (not placeholders).
 - [ ] Commitment is processed in both SubscribeRequest and slot filter.
 - [ ] Reconnect loop is outer; consume loop is inner.
-- [ ] Channel send is try_send (non-blocking).
+- [ ] Channel send is two-tier: try_send for slots, blocking send for accounts.
 - [ ] ARB_DRY_RUN=true and ARB_REQUIRE_CONFIRM=true remain set.
 - [ ] Observed account update log lines in a dry-run session.
